@@ -14,7 +14,7 @@ jobs:
       - id: set-matrix
         run: |
           # 在这里配置你要监控的仓库列表，支持无限添加
-          WATCH_LIST='["Silent1566/webhtv","Silent1566/webhtv-pc"]'
+          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc"]'
           echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
 
   # 第二步：并发处理每个仓库
@@ -24,7 +24,7 @@ jobs:
     permissions:
       contents: write
     strategy:
-      fail-fast: false # 如果其中一个仓库报错，不影响其他仓库继续运行
+      fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
     env:
       FULL_REPO: ${{ matrix.repo }}
@@ -35,13 +35,13 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GH_PAT }} # 强制使用你的 PAT 拉取并推送代码
-          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }} # 强制使用你的 PAT 拉取
 
       - name: install jq
         run: sudo apt update && sudo apt install -y jq
 
-      - name: fetch and download
+      # ================= 🚨 新增：纯粹的版本检测 =================
+      - name: check version
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -53,6 +53,7 @@ jobs:
 
           if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
             echo "❌ ${FULL_REPO} API 异常"
+            echo "SKIP=true" >> $GITHUB_ENV
             exit 0
           fi
 
@@ -65,6 +66,7 @@ jobs:
           tag=$(jq -r '.tag_name // empty' rel.json)
           if [ -z "$tag" ] || [ "$tag" = "null" ]; then
             echo "⚠️ ${FULL_REPO} 没有找到 Release"
+            echo "SKIP=true" >> $GITHUB_ENV
             exit 0
           fi
 
@@ -78,33 +80,36 @@ jobs:
           fi
 
           if [ "$tag" = "$LAST_TAG" ]; then
-            echo "⏭️ 版本未更新 ($tag)，跳过。"
+            echo "⏭️ 版本未更新 ($tag)，直接跳过后续所有步骤。"
             echo "SKIP=true" >> $GITHUB_ENV
             exit 0
           fi
 
           echo "🚀 发现新版本: $tag"
-
-          # 写入环境变量
+          echo "SKIP=false" >> $GITHUB_ENV
+          
+          # 写入环境变量供后续步骤使用
           echo "UPSTREAM_TAG=${tag}" >> $GITHUB_ENV
           SAFE_TAG=$(echo "${FULL_REPO##*/}-${tag}" | tr '/' '-')
           echo "MIRROR_TAG=${SAFE_TAG}" >> $GITHUB_ENV
           echo "MIRROR_NAME=[镜像] ${FULL_REPO} ${tag}" >> $GITHUB_ENV
 
-          # ================= 🚨 新增：提取原更新日志用于上传备注 =================
-          # 提取原 body 内容，并在最上方加上来源标注
+      # ================= 🚨 新增：只有确实有更新才下载 =================
+      - name: download files
+        if: env.SKIP != 'true'
+        run: |
+          echo "开始下载资源..."
           ORIGINAL_BODY=$(jq -r '.body // ""' rel.json)
           {
             echo "## 镜像来源"
             echo "- **上游仓库**: [${FULL_REPO}](https://github.com/${FULL_REPO})"
-            echo "- **上游版本**: \`${tag}\`"
+            echo "- **上游版本**: \`${UPSTREAM_TAG}\`"
             echo ""
             echo "---"
             echo ""
             echo "$ORIGINAL_BODY"
           } > mirror_body.md
           
-          # 将文件路径传给下一步（因为如果内容很长，没法直接塞进 GITHUB_ENV）
           echo "MIRROR_BODY_FILE=mirror_body.md" >> $GITHUB_ENV
 
           IFS=',' read -ra exts <<< "$ALLOW_EXT"
@@ -117,7 +122,6 @@ jobs:
             fi
           done
 
-          # 下载
           mkdir -p downloads
           jq -r --arg filter "$filter" \
             '.assets[] | select((.name | $filter) and (.name | test("\\.(json|txt|md)$"; "i") | not)) | .browser_download_url' \
@@ -137,21 +141,18 @@ jobs:
           find downloads/ -type f \( -name "*.json" -o -name "*.txt" -o -name "*.md" \) -exec rm -f {} +
 
           if [ "$download_success" = "false" ] || [ -z "$(ls -A downloads)" ]; then
-            echo "⚠️ 没有下载到合规的安装包，跳过上传。"
+            echo "⚠️ 没有下载到合规的安装包，跳过。"
             echo "SKIP=true" >> $GITHUB_ENV
             exit 0
           fi
-
-          echo "SKIP=false" >> $GITHUB_ENV
           
-          # 暂存消息头
           name=$(jq -r '.name // .tag_name' rel.json)
           url=$(jq -r '.html_url' rel.json)
           MSG_FILE=$(mktemp)
           {
             echo "*🚀发现新版本 Release*"
             echo "仓库：\`${FULL_REPO}\`"
-            echo "版本：\`${tag}\`"
+            echo "版本：\`${UPSTREAM_TAG}\`"
             echo "标题：${name}"
             echo "[查看原Release页面](${url})"
             echo ""
@@ -164,7 +165,6 @@ jobs:
         with:
           tag_name: ${{ env.MIRROR_TAG }}
           name: ${{ env.MIRROR_NAME }}
-          # 🚨 读取上面生成的包含来源和原更新日志的文件
           body_path: ${{ env.MIRROR_BODY_FILE }}
           files: downloads/*
           token: ${{ secrets.GH_PAT }}
@@ -190,9 +190,9 @@ jobs:
             case "$filename" in
               *leanback*arm64*)   display_name="📺 TV ARM64版" ;;
               *leanback*armeabi*) display_name="📺 TV ARMeabi版" ;;
-              *mobile*v8*)           display_name="📱 安卓版 v8" ;;
-              *mobile*v7*)           display_name="📱 安卓版 v7" ;;
-              *windows*|*pc*|*.exe)    display_name="🪟 Windows 客户端" ;;
+              *mobile*v8*)        display_name="📱 安卓版 v8" ;;
+              *mobile*v7*)        display_name="📱 安卓版 v7" ;;
+              *windows*|*pc*|*.exe) display_name="🪟 Windows 客户端" ;;
               *macos*|*darwin*)   display_name="🍎 macOS 客户端" ;;
               *universal*)        display_name="📦 通用版" ;;
               *x86*|*x64*)        display_name="💻 电脑 x86/x64版" ;;
@@ -233,13 +233,17 @@ jobs:
           path: last_tag_*.txt
           retention-days: 1
 
-  # 第三步：汇总所有并发的任务，统一 commit 和 push 状态文件
+  # 第三步：汇总并提交状态文件（终极稳定版）
   commit-tags:
     needs: check-release
+    # 只有在确实有任务生成了 artifact 时才运行
+    if: always() && needs.check-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
 
       - name: download all artifacts
         uses: actions/download-artifact@v4
@@ -252,21 +256,13 @@ jobs:
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
           
-          # 强制使用你的 GH_PAT 推送，彻底绕过 github-actions[bot] 的 403 权限问题
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
-          
           if [ -n "$(git status --porcelain)" ]; then
             echo "发现更新，准备提交..."
-            
-            # 使用 -A 把工作区所有的变动加进去（避免通配符匹配不到报错）
-            # 然后通过 reset 排除掉临时产生的 json 或 md 文件，只提交 txt 记录
             git add -A
-            
-            # 把非记录文件从暂存区剔除（如果存在的话，不报错）
+            # 排除临时文件
             git reset HEAD rel.json releases.json mirror_rel.json 2>/dev/null || true
-            
-            git commit -m "update tags and msg ids [skip ci]"
-            git push origin HEAD:${GITHUB_REF#refs/heads/}
+            git commit -m "update tags [skip ci]"
+            git push
           else
-            echo "无更新。"
+            echo "无更新，无需提交。"
           fi

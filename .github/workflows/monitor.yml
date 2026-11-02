@@ -252,11 +252,19 @@ jobs:
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
           
-          # 强制重新设置 remote 地址，带上你的 Token，彻底绕过默认 Token
+          # 强制使用你的 GH_PAT 推送，彻底绕过 github-actions[bot] 的 403 权限问题
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
           
           if [ -n "$(git status --porcelain)" ]; then
-            git add last_tag_*.txt last_tg_msg_*.txt
+            echo "发现更新，准备提交..."
+            
+            # 使用 -A 把工作区所有的变动加进去（避免通配符匹配不到报错）
+            # 然后通过 reset 排除掉临时产生的 json 或 md 文件，只提交 txt 记录
+            git add -A
+            
+            # 把非记录文件从暂存区剔除（如果存在的话，不报错）
+            git reset HEAD rel.json releases.json mirror_rel.json 2>/dev/null || true
+            
             git commit -m "update tags and msg ids [skip ci]"
             git push origin HEAD:${GITHUB_REF#refs/heads/}
           else

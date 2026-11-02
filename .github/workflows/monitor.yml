@@ -1,3 +1,4 @@
+
 name: Github Release Monitor -> Telegram
 on:
   schedule:
@@ -123,13 +124,39 @@ jobs:
               echo '```'
             } > "$MSG_FILE"
 
-            echo "发送至 Telegram..."
+            # 1. 先发一条文本消息（说明）
+            echo "发送更新通知至 Telegram..."
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT_ID}" \
               -d "parse_mode=Markdown" \
               -d "disable_web_page_preview=true" \
               --data-urlencode "text@${MSG_FILE}" \
-              -w "\nTelegram HTTP 响应码: %{http_code}\n"
+              -w "\nTelegram 消息 HTTP 响应码: %{http_code}\n"
+            
+            # 2. 下载安装包并发送文件
+            # 提取第一个匹配的下载链接
+            DOWNLOAD_URL=$(jq -r --arg filter "$filter" '.assets[] | select(.name | $filter) | .browser_download_url' rel.json | head -1)
+            
+            if [ -n "$DOWNLOAD_URL" ]; then
+              ASSET_NAME=$(basename "$DOWNLOAD_URL")
+              echo "正在下载安装包: $ASSET_NAME ..."
+              
+              # 使用 gh-proxy 加速下载
+              curl -L -s "https://gh-proxy.com/${DOWNLOAD_URL}" -o "$ASSET_NAME"
+              
+              # 检查文件大小 (Telegram Bot API 限制 50MB)
+              FILE_SIZE=$(stat -c%s "$ASSET_NAME")
+              if [ "$FILE_SIZE" -gt 52428800 ]; then
+                echo "❌ 文件大于 50MB，Bot 无法发送，跳过文件发送。"
+              else
+                echo "发送文件至 Telegram..."
+                curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+                  -F "chat_id=${TG_CHAT_ID}" \
+                  -F "document=@${ASSET_NAME}" \
+                  -F "caption=🚀 ${FULL_REPO} 版本: ${tag}" \
+                  -w "\nTelegram 文件 HTTP 响应码: %{http_code}\n"
+              fi
+            fi
 
             # 更新状态文件
             echo "$tag" > "$LAST_TAG_FILE"
@@ -149,3 +176,4 @@ jobs:
           else
             echo "没有新版本更新，无需提交。"
           fi
+          

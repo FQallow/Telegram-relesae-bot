@@ -34,6 +34,9 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }} # 强制使用你的 PAT 拉取并推送代码
+          fetch-depth: 0
 
       - name: install jq
         run: sudo apt update && sudo apt install -y jq

@@ -2,7 +2,7 @@ name: Github Release Monitor -> Telegram
 on:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch: # 手动
+  workflow_dispatch: # 手动触发
 
 env:
   TARGET_OWNER: "Silent1566"
@@ -27,29 +27,40 @@ jobs:
         id: fetch_rel
         run: |
           GH_TOKEN="${{ secrets.GH_PAT }}"
-          API_URL="${GH_PROXY}https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/releases"
+          # 1. 去除代理，直接请求官方 API
+          API_URL="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/releases"
+          
           if [ -n "$GH_TOKEN" ]; then
             HEADER=(-H "Authorization: token $GH_TOKEN")
           else
             HEADER=()
           fi
-          # 拉取 releases 列表，保存原始响应便于排错
+          
+          # 2. 拉取数据并保存
           curl -s "${HEADER[@]}" "$API_URL" > releases.json
 
-          # 校验返回是否为数组（防止限流/404 返回对象）
+          # 3. 打印返回内容（用于排错）
+          echo "====== API 返回的内容前 500 个字符 ======"
+          head -c 500 releases.json
+          echo -e "\n========================================="
+
+          # 4. 校验是不是数组
           if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
-            echo "API 返回异常，非数组，内容如下："
+            echo "❌ API 返回异常，不是数组！可能是被限流或仓库不存在。"
             cat releases.json
             exit 0
           fi
 
-          # 过滤 prerelease 并取最新一条，写入 rel.json
+          # 5. 过滤并提取
           jq 'map(select( (.prerelease == false) or ("'"$SKIP_PRERELEASE"'" == "false") )) | .[0]' releases.json > rel.json
           tag=$(jq -r '.tag_name // empty' rel.json)
+          
           if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-            echo "没有找到 release"
+            echo "❌ 没有找到符合条件的最新 release"
             exit 0
           fi
+          
+          echo "✅ 找到最新 TAG: $tag"
           echo "TAG=$tag" >> "$GITHUB_ENV"
 
       - name: read last saved tag
@@ -112,11 +123,14 @@ jobs:
             echo '```'
           } > "$MSG_FILE"
 
+          # 发送请求，并打印 HTTP 状态码方便排错
+          echo "正在发送至 Telegram..."
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TG_CHAT_ID}" \
             -d "parse_mode=Markdown" \
             -d "disable_web_page_preview=true" \
-            --data-urlencode "text@${MSG_FILE}"
+            --data-urlencode "text@${MSG_FILE}" \
+            -w "\nTelegram HTTP 响应码: %{http_code}\n"
 
           echo "$tag" > last_tag.txt
 

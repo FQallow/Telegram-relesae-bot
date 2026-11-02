@@ -114,8 +114,8 @@ jobs:
                 *windows*|*.exe) display_name="🪟 Windows 客户端" ;;
                 *macos*|*darwin*)display_name="🍎 macOS 客户端" ;;
                 *mobile*)   display_name="📱 安卓版" ;;
-                *leanback*&&*arm64*)   display_name="📺 TV ARM64版" ;;
-                *leanback*&&*armeabi*)   display_name="📺 TV ARMeabi版" ;;
+                *leanback*arm64*)   display_name="📺 TV ARM64版" ;;
+                *leanback*armeabi*)   display_name="📺 TV ARMeabi版" ;;
               esac
               
               # 拼接 Markdown 隐藏链接格式

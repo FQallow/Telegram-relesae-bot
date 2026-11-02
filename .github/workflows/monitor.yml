@@ -4,22 +4,33 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch: # 手动触发
 
-env:
-  WATCH_LIST: |
-    [
-      "Silent1566/webhtv"
-    ]
-    
-  SKIP_PRERELEASE: "false"
-  ALLOW_EXT: ".apk,.exe,.zip,.AppImage"
-  # 强烈建议加上代理，这样手机点下载秒下
-  GH_PROXY: "https://gh-proxy.com/" 
-
 jobs:
+  # 第一步：准备工作，读取监控列表，生成 matrix 矩阵
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # 在这里配置你要监控的仓库列表，支持无限添加
+          WATCH_LIST='["Silent1566/webhtv"]'
+          echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
+
+  # 第二步：并发处理每个仓库
   check-release:
+    needs: setup
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false # 如果其中一个仓库报错，不影响其他仓库继续运行
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env:
+      FULL_REPO: ${{ matrix.repo }}
+      SKIP_PRERELEASE: "false"
+      ALLOW_EXT: ".apk,.exe,.zip,.AppImage"
+      GH_PROXY: "https://gh-proxy.com/"
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -27,131 +38,138 @@ jobs:
       - name: install jq
         run: sudo apt update && sudo apt install -y jq
 
-      - name: fetch and check releases
-        id: check
+      - name: fetch and download
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          HEADER=(-H "Authorization: token $GH_TOKEN")
+          echo "========================================="
+          echo "🔍 正在检查仓库: ${FULL_REPO}"
+          
+          API_URL="https://api.github.com/repos/${FULL_REPO}/releases"
+          curl -s -H "Authorization: token $GH_TOKEN" "$API_URL" > releases.json
 
-          echo "$WATCH_LIST" | jq -r '.[]' | while read -r FULL_REPO; do
-            [ -z "$FULL_REPO" ] && continue
-            echo "========================================="
-            echo "🔍 正在检查仓库: ${FULL_REPO}"
-            
-            API_URL="https://api.github.com/repos/${FULL_REPO}/releases"
-            curl -s "${HEADER[@]}" "$API_URL" > releases.json
+          if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
+            echo "❌ ${FULL_REPO} API 异常"
+            exit 0
+          fi
 
-            if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
-              echo "❌ ${FULL_REPO} API 异常"
-              continue
-            fi
+          if [ "$SKIP_PRERELEASE" = "true" ]; then
+            jq '[.[] | select(.prerelease == false)] | .[0]' releases.json > rel.json
+          else
+            jq '.[0]' releases.json > rel.json
+          fi
+          
+          tag=$(jq -r '.tag_name // empty' rel.json)
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "⚠️ ${FULL_REPO} 没有找到 Release"
+            exit 0
+          fi
 
-            if [ "$SKIP_PRERELEASE" = "true" ]; then
-              jq '[.[] | select(.prerelease == false)] | .[0]' releases.json > rel.json
+          SAFE_REPO_NAME=$(echo "$FULL_REPO" | tr '/' '_')
+          LAST_TAG_FILE="last_tag_${SAFE_REPO_NAME}.txt"
+
+          if [ -f "$LAST_TAG_FILE" ]; then
+            LAST_TAG=$(cat "$LAST_TAG_FILE")
+          else
+            LAST_TAG=""
+          fi
+
+          if [ "$tag" = "$LAST_TAG" ]; then
+            echo "⏭️ 版本未更新 ($tag)，跳过。"
+            echo "SKIP=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "🚀 发现新版本: $tag"
+
+          # 写入环境变量
+          echo "UPSTREAM_TAG=${tag}" >> $GITHUB_ENV
+          SAFE_TAG=$(echo "${FULL_REPO##*/}-${tag}" | tr '/' '-')
+          echo "MIRROR_TAG=${SAFE_TAG}" >> $GITHUB_ENV
+          echo "MIRROR_NAME=[镜像] ${FULL_REPO} ${tag}" >> $GITHUB_ENV
+
+          # ================= 🚨 新增：提取原更新日志用于上传备注 =================
+          # 提取原 body 内容，并在最上方加上来源标注
+          ORIGINAL_BODY=$(jq -r '.body // ""' rel.json)
+          {
+            echo "## 镜像来源"
+            echo "- **上游仓库**: [${FULL_REPO}](https://github.com/${FULL_REPO})"
+            echo "- **上游版本**: \`${tag}\`"
+            echo ""
+            echo "---"
+            echo ""
+            echo "$ORIGINAL_BODY"
+          } > mirror_body.md
+          
+          # 将文件路径传给下一步（因为如果内容很长，没法直接塞进 GITHUB_ENV）
+          echo "MIRROR_BODY_FILE=mirror_body.md" >> $GITHUB_ENV
+
+          IFS=',' read -ra exts <<< "$ALLOW_EXT"
+          filter=""
+          for e in "${exts[@]}"; do
+            if [ -z "$filter" ]; then
+              filter="endswith(\"$e\")"
             else
-              jq '.[0]' releases.json > rel.json
+              filter="$filter or endswith(\"$e\")"
             fi
-            
-            tag=$(jq -r '.tag_name // empty' rel.json)
-            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-              echo "⚠️ ${FULL_REPO} 没有找到 Release"
-              continue
-            fi
-
-            SAFE_REPO_NAME=$(echo "$FULL_REPO" | tr '/' '_')
-            LAST_TAG_FILE="last_tag_${SAFE_REPO_NAME}.txt"
-
-            if [ -f "$LAST_TAG_FILE" ]; then
-              LAST_TAG=$(cat "$LAST_TAG_FILE")
-            else
-              LAST_TAG=""
-            fi
-
-            if [ "$tag" = "$LAST_TAG" ]; then
-              echo "⏭️ 版本未更新 ($tag)，跳过。"
-              continue
-            fi
-
-            echo "🚀 发现新版本: $tag"
-
-            # ================= 准备上传到本仓库 =================
-            echo "UPSTREAM_REPO=${FULL_REPO}" >> $GITHUB_ENV
-            echo "UPSTREAM_TAG=${tag}" >> $GITHUB_ENV
-            SAFE_TAG=$(echo "${FULL_REPO##*/}-${tag}" | tr '/' '-')
-            echo "MIRROR_TAG=${SAFE_TAG}" >> $GITHUB_ENV
-            echo "MIRROR_NAME=[镜像] ${FULL_REPO} ${tag}" >> $GITHUB_ENV
-
-            IFS=',' read -ra exts <<< "$ALLOW_EXT"
-            filter=""
-            for e in "${exts[@]}"; do
-              if [ -z "$filter" ]; then
-                filter="endswith(\"$e\")"
-              else
-                filter="$filter or endswith(\"$e\")"
-              fi
-            done
-
-            # 下载资产到本地（强化过滤：必须以后缀结尾，且绝对不能包含 json/txt/md）
-            mkdir -p downloads
-            jq -r --arg filter "$filter" \
-              '.assets[] | select((.name | $filter) and (.name | test("\\.(json|txt|md)$"; "i") | not)) | .browser_download_url' \
-              rel.json > dl_links.txt
-            
-            download_success=false
-            while read -r dl_url; do
-              [ -z "$dl_url" ] && continue
-              filename=$(basename "$dl_url")
-              echo "正在下载: $filename"
-              curl -L -s -o "downloads/$filename" "${GH_PROXY}${dl_url}"
-              if [ -f "downloads/$filename" ]; then
-                download_success=true
-              fi
-            done < dl_links.txt
-
-            # 如果下载完后还是混进了 json，再强行清洗一遍
-            find downloads/ -type f \( -name "*.json" -o -name "*.txt" -o -name "*.md" \) -exec rm -f {} +
-
-            if [ "$download_success" = "false" ] || [ -z "$(ls -A downloads)" ]; then
-              echo "⚠️ 没有下载到合规的安装包，跳过上传。"
-              continue
-            fi
-
-            # 组装 TG 消息的文本部分
-            name=$(jq -r '.name // .tag_name' rel.json)
-            url=$(jq -r '.html_url' rel.json)
-            body=$(jq -r '.body // ""' rel.json | head -c 1000)
-
-            MSG_FILE=$(mktemp)
-            {
-              echo "*🚀发现新版本 Release*"
-              echo "仓库：\`${FULL_REPO}\`"
-              echo "版本：\`${tag}\`"
-              echo "标题：${name}"
-              echo "[查看原Release页面](${url})"
-              echo ""
-            } > "$MSG_FILE"
-
-            echo "MSG_FILE_PATH=${MSG_FILE}" >> $GITHUB_ENV
-            break 
           done
 
+          # 下载
+          mkdir -p downloads
+          jq -r --arg filter "$filter" \
+            '.assets[] | select((.name | $filter) and (.name | test("\\.(json|txt|md)$"; "i") | not)) | .browser_download_url' \
+            rel.json > dl_links.txt
+          
+          download_success=false
+          while read -r dl_url; do
+            [ -z "$dl_url" ] && continue
+            filename=$(basename "$dl_url")
+            echo "正在下载: $filename"
+            curl -L -s -o "downloads/$filename" "${GH_PROXY}${dl_url}"
+            if [ -f "downloads/$filename" ]; then
+              download_success=true
+            fi
+          done < dl_links.txt
+
+          find downloads/ -type f \( -name "*.json" -o -name "*.txt" -o -name "*.md" \) -exec rm -f {} +
+
+          if [ "$download_success" = "false" ] || [ -z "$(ls -A downloads)" ]; then
+            echo "⚠️ 没有下载到合规的安装包，跳过上传。"
+            echo "SKIP=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "SKIP=false" >> $GITHUB_ENV
+          
+          # 暂存消息头
+          name=$(jq -r '.name // .tag_name' rel.json)
+          url=$(jq -r '.html_url' rel.json)
+          MSG_FILE=$(mktemp)
+          {
+            echo "*🚀发现新版本 Release*"
+            echo "仓库：\`${FULL_REPO}\`"
+            echo "版本：\`${tag}\`"
+            echo "标题：${name}"
+            echo "[查看原Release页面](${url})"
+            echo ""
+          } > "$MSG_FILE"
+          echo "MSG_FILE_PATH=${MSG_FILE}" >> $GITHUB_ENV
+
       - name: upload to our repository
-        if: env.MIRROR_TAG != ''
+        if: env.SKIP != 'true'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.MIRROR_TAG }}
           name: ${{ env.MIRROR_NAME }}
-          body: "Mirrored from ${{ env.UPSTREAM_REPO }} (${{ env.UPSTREAM_TAG }})"
+          # 🚨 读取上面生成的包含来源和原更新日志的文件
+          body_path: ${{ env.MIRROR_BODY_FILE }}
           files: downloads/*
           token: ${{ secrets.GH_PAT }}
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
 
-      - name: send telegram message with mirror links
-        if: env.MIRROR_TAG != ''
+      - name: send telegram
+        if: env.SKIP != 'true'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -164,10 +182,7 @@ jobs:
           
           while IFS='|' read -r filename download_url; do
             [ -z "$filename" ] && continue
-            
-            # 给你自己仓库的镜像链接加上代理
             full_url="${GH_PROXY}${download_url}"
-            
             display_name="$filename"
             case "$filename" in
               *leanback*arm64*)   display_name="📺 TV ARM64版" ;;
@@ -178,13 +193,10 @@ jobs:
               *universal*)        display_name="📦 通用版" ;;
               *x86*|*x64*)        display_name="💻 电脑 x86/x64版" ;;
             esac
-            
             assets="${assets}- [${display_name}](${full_url})"$'\n'
           done < mirror_assets.txt
 
-          if [ -z "$assets" ]; then
-            assets="无匹配过滤规则的安装包"
-          fi
+          [ -z "$assets" ] && assets="无匹配过滤规则的安装包"
 
           {
             echo "📦下载资产（本仓库镜像）："
@@ -196,7 +208,6 @@ jobs:
             echo '```'
           } >> "$MSG_FILE_PATH"
 
-          echo "发送至 Telegram..."
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TG_CHAT_ID}" \
             -d "parse_mode=Markdown" \
@@ -204,23 +215,42 @@ jobs:
             --data-urlencode "text@${MSG_FILE_PATH}" \
             -w "\nTG 响应码: %{http_code}\n"
 
-          SAFE_REPO_NAME=$(echo "${UPSTREAM_REPO}" | tr '/' '_')
+      - name: save tag artifact
+        if: env.SKIP != 'true'
+        run: |
+          SAFE_REPO_NAME=$(echo "$FULL_REPO" | tr '/' '_')
           echo "${UPSTREAM_TAG}" > "last_tag_${SAFE_REPO_NAME}.txt"
           
-          rm -rf downloads rel.json releases.json mirror_rel.json mirror_assets.txt
+      - name: upload tag artifact
+        if: env.SKIP != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tag-${{ strategy.job-index }}
+          path: last_tag_*.txt
+          retention-days: 1
+
+  # 第三步：汇总所有并发的任务，统一 commit 和 push 状态文件
+  commit-tags:
+    needs: check-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tag-*
+          merge-multiple: true
 
       - name: commit new tags
         run: |
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
-          
-          rm -f rel.json releases.json assets_temp.txt
-          
-          if git status --porcelain | grep -q "last_tag_"; then
-            echo "发现新更新的记录，准备提交..."
+          if [ -n "$(git status --porcelain)" ]; then
             git add last_tag_*.txt
             git commit -m "update last tags [skip ci]"
             git push
           else
-            echo "没有新版本更新，无需提交。"
+            echo "无更新。"
           fi

@@ -2,7 +2,7 @@ name: Github Release Monitor -> Telegram
 on:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch: # 手动触发
+  workflow_dispatch: # 手动
 
 env:
   TARGET_OWNER: "Silent1566"

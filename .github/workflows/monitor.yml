@@ -5,10 +5,14 @@ on:
   workflow_dispatch: # 手动触发
 
 env:
-  TARGET_OWNER: "Silent1566"
-  TARGET_REPO: "webhtv"
+  # 在这里配置你要监控的仓库列表，支持不同作者，支持无限添加
+  # 格式：作者/仓库名
+  WATCH_LIST: |
+    [
+      "Silent1566/webhtv"
+    ]
+    
   SKIP_PRERELEASE: "false"
-  GH_PROXY: "https://gh-proxy.com/"
   ALLOW_EXT: ".apk,.exe,.zip,.AppImage"
 
 jobs:
@@ -23,122 +27,134 @@ jobs:
       - name: install jq
         run: sudo apt update && sudo apt install -y jq
 
-      - name: fetch latest release
-        id: fetch_rel
+      - name: fetch and check releases
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           GH_TOKEN="${{ secrets.GH_PAT }}"
-          # 1. 去除代理，直接请求官方 API
-          API_URL="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/releases"
-          
           if [ -n "$GH_TOKEN" ]; then
             HEADER=(-H "Authorization: token $GH_TOKEN")
           else
             HEADER=()
           fi
-          
-          # 2. 拉取数据并保存
-          curl -s "${HEADER[@]}" "$API_URL" > releases.json
 
-          # 3. 打印返回内容（用于排错）
-          echo "====== API 返回的内容前 500 个字符 ======"
-          head -c 500 releases.json
-          echo -e "\n========================================="
+          HAS_NEW_COMMIT=false
 
-          # 4. 校验是不是数组
-          if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
-            echo "❌ API 返回异常，不是数组！可能是被限流或仓库不存在。"
-            cat releases.json
-            exit 0
-          fi
+          # 使用 jq 解析 JSON 数组，逐行读取 "作者/仓库"
+          echo "$WATCH_LIST" | jq -r '.[]' | while read -r FULL_REPO; do
+            [ -z "$FULL_REPO" ] && continue
+            
+            echo "========================================="
+            echo "🔍 正在检查仓库: ${FULL_REPO}"
+            
+            API_URL="https://api.github.com/repos/${FULL_REPO}/releases"
+            curl -s "${HEADER[@]}" "$API_URL" > releases.json
 
-          # 5. 过滤并提取
-          jq 'map(select( (.prerelease == false) or ("'"$SKIP_PRERELEASE"'" == "false") )) | .[0]' releases.json > rel.json
-          tag=$(jq -r '.tag_name // empty' rel.json)
-          
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-            echo "❌ 没有找到符合条件的最新 release"
-            exit 0
-          fi
-          
-          echo "✅ 找到最新 TAG: $tag"
-          echo "TAG=$tag" >> "$GITHUB_ENV"
-
-      - name: read last saved tag
-        id: read_last
-        run: |
-          if [ -f last_tag.txt ]; then
-            last=$(cat last_tag.txt)
-          else
-            last=""
-          fi
-          echo "LAST_TAG=$last" >> "$GITHUB_ENV"
-
-      - name: compare and send telegram
-        if: env.TAG != env.LAST_TAG
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OWNER: ${{ env.TARGET_OWNER }}
-          REPO: ${{ env.TARGET_REPO }}
-        run: |
-          # 全部用 jq 直接读 rel.json，彻底避免 shell 拼接 JSON
-          tag=$(jq -r '.tag_name' rel.json)
-          name=$(jq -r '.name // .tag_name' rel.json)
-          url=$(jq -r '.html_url' rel.json)
-          body=$(jq -r '.body // ""' rel.json | head -c 1200)
-
-          # 构造 jq 过滤器
-          IFS=',' read -ra exts <<< "$ALLOW_EXT"
-          filter=""
-          for e in "${exts[@]}"; do
-            if [ -z "$filter" ]; then
-              filter="endswith(\"$e\")"
-            else
-              filter="$filter or endswith(\"$e\")"
+            # 校验 API
+            if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
+              echo "❌ ${FULL_REPO} 的 API 返回异常（可能不存在或被限流）"
+              continue
             fi
+
+            # 提取最新的符合要求的 Release
+            if [ "$SKIP_PRERELEASE" = "true" ]; then
+              jq '[.[] | select(.prerelease == false)] | .[0]' releases.json > rel.json
+            else
+              jq '.[0]' releases.json > rel.json
+            fi
+            
+            tag=$(jq -r '.tag_name // empty' rel.json)
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              echo "⚠️ ${FULL_REPO} 没有找到符合条件的 Release"
+              continue
+            fi
+
+            # 将 "作者/仓库" 中的 "/" 替换为 "_" 生成文件名
+            SAFE_REPO_NAME=$(echo "$FULL_REPO" | tr '/' '_')
+            LAST_TAG_FILE="last_tag_${SAFE_REPO_NAME}.txt"
+
+            if [ -f "$LAST_TAG_FILE" ]; then
+              LAST_TAG=$(cat "$LAST_TAG_FILE")
+            else
+              LAST_TAG=""
+            fi
+
+            # 对比
+            if [ "$tag" = "$LAST_TAG" ]; then
+              echo "⏭️ ${FULL_REPO} 版本未更新 (当前: $tag)，跳过。"
+              continue
+            fi
+
+            echo "🚀 ${FULL_REPO} 发现新版本: $tag (上次: ${LAST_TAG:-无})"
+
+            # ================= 组装并发送 Telegram =================
+            name=$(jq -r '.name // .tag_name' rel.json)
+            url=$(jq -r '.html_url' rel.json)
+            body=$(jq -r '.body // ""' rel.json | head -c 1000)
+
+            IFS=',' read -ra exts <<< "$ALLOW_EXT"
+            filter=""
+            for e in "${exts[@]}"; do
+              if [ -z "$filter" ]; then
+                filter="endswith(\"$e\")"
+              else
+                filter="$filter or endswith(\"$e\")"
+              fi
+            done
+
+            assets=$(jq -r --arg filter "$filter" \
+              '.assets[] | select(.name | $filter) | "- [" + .name + "](" + .browser_download_url + ")"' \
+              rel.json | head -5)
+            [ -z "$assets" ] && assets="无匹配过滤规则的安装包"
+
+            MSG_FILE=$(mktemp)
+            {
+              echo "*🚀发现新版本 Release*"
+              echo "仓库：\`${FULL_REPO}\`"
+              echo "版本：\`${tag}\`"
+              echo "标题：${name}"
+              echo "[查看Release页面](${url})"
+              echo ""
+              echo "📦匹配资产："
+              echo "${assets}"
+              echo ""
+              echo "📝更新日志："
+              echo '```'
+              echo "${body}"
+              echo '```'
+            } > "$MSG_FILE"
+
+            echo "发送至 Telegram..."
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TG_CHAT_ID}" \
+              -d "parse_mode=Markdown" \
+              -d "disable_web_page_preview=true" \
+              --data-urlencode "text@${MSG_FILE}" \
+              -w "\nTelegram HTTP 响应码: %{http_code}\n"
+
+            # 更新状态文件
+            echo "$tag" > "$LAST_TAG_FILE"
+            HAS_NEW_COMMIT=true
           done
 
-          assets=$(jq -r --arg filter "$filter" \
-            '.assets[] | select(.name | $filter) | "- [" + .name + "](" + .browser_download_url + ")"' \
-            rel.json | head -5)
-          if [ -z "$assets" ]; then
-            assets="无匹配过滤规则的安装包"
+          # 因为用了 while 管道，子 shell 的变量传不出来，改用检查是否有新文件
+          if ls last_tag_*.txt >/dev/null 2>&1; then
+            echo "NEW_TAGS_FOUND=true" >> "$GITHUB_ENV"
+          else
+            echo "NEW_TAGS_FOUND=false" >> "$GITHUB_ENV"
           fi
 
-          # 组装消息（放到临时文件，用 --data-urlencode 发送，避免引号问题）
-          MSG_FILE=$(mktemp)
-          {
-            echo "*🚀发现新版本 Release*"
-            echo "仓库：\`${OWNER}/${REPO}\`"
-            echo "版本：\`${tag}\`"
-            echo "标题：${name}"
-            echo "[查看Release页面](${url})"
-            echo ""
-            echo "📦匹配资产："
-            echo "${assets}"
-            echo ""
-            echo "📝更新日志："
-            echo '```'
-            echo "${body}"
-            echo '```'
-          } > "$MSG_FILE"
-
-          # 发送请求，并打印 HTTP 状态码方便排错
-          echo "正在发送至 Telegram..."
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            -d "parse_mode=Markdown" \
-            -d "disable_web_page_preview=true" \
-            --data-urlencode "text@${MSG_FILE}" \
-            -w "\nTelegram HTTP 响应码: %{http_code}\n"
-
-          echo "$tag" > last_tag.txt
-
-      - name: commit new tag
-        if: env.TAG != env.LAST_TAG
+      - name: commit new tags
+        # 只要文件夹里有未提交的修改，就执行 push
         run: |
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
-          git add last_tag.txt
-          git commit -m "update last tag: ${{ env.TAG }}" || echo "nothing to commit"
-          git push
+          
+          # 检查是否有文件变动
+          if [[ -n $(git status --porcelain) ]]; then
+            git add last_tag_*.txt
+            git commit -m "update last tags [skip ci]"
+            git push
+          else
+            echo

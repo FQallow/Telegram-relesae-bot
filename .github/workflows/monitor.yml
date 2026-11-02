@@ -26,41 +26,57 @@ jobs:
       - name: fetch latest release
         id: fetch_rel
         run: |
-          GH_TOKEN=${{ secrets.GH_PAT }}
+          GH_TOKEN="${{ secrets.GH_PAT }}"
           API_URL="${GH_PROXY}https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/releases"
           if [ -n "$GH_TOKEN" ]; then
-            HEADER="-H Authorization:token $GH_TOKEN"
+            HEADER=(-H "Authorization: token $GH_TOKEN")
           else
-            HEADER=""
+            HEADER=()
           fi
-          rel=$(curl -s $HEADER "$API_URL" | jq 'map(select( (.prerelease == false) or ("'$SKIP_PRERELEASE'" == "false") )) | .[0]')
-          tag=$(echo $rel | jq -r '.tag_name')
-          if [ "$tag" = "null" ];then
-            echo "没有找到release"
+          # 拉取 releases 列表，保存原始响应便于排错
+          curl -s "${HEADER[@]}" "$API_URL" > releases.json
+
+          # 校验返回是否为数组（防止限流/404 返回对象）
+          if ! jq -e 'type == "array"' releases.json >/dev/null 2>&1; then
+            echo "API 返回异常，非数组，内容如下："
+            cat releases.json
             exit 0
           fi
-          echo "TAG=$tag" >> $GITHUB_ENV
-          echo "REL_JSON=$rel" >> $GITHUB_ENV
+
+          # 过滤 prerelease 并取最新一条，写入 rel.json
+          jq 'map(select( (.prerelease == false) or ("'"$SKIP_PRERELEASE"'" == "false") )) | .[0]' releases.json > rel.json
+          tag=$(jq -r '.tag_name // empty' rel.json)
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "没有找到 release"
+            exit 0
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
 
       - name: read last saved tag
         id: read_last
         run: |
-          if [ -f last_tag.txt ];then
+          if [ -f last_tag.txt ]; then
             last=$(cat last_tag.txt)
           else
             last=""
           fi
-          echo "LAST_TAG=$last" >> $GITHUB_ENV
+          echo "LAST_TAG=$last" >> "$GITHUB_ENV"
 
       - name: compare and send telegram
         if: env.TAG != env.LAST_TAG
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          OWNER: ${{ env.TARGET_OWNER }}
+          REPO: ${{ env.TARGET_REPO }}
         run: |
-          rel='${{ env.REL_JSON }}'
-          tag=$(echo $rel | jq -r '.tag_name')
-          name=$(echo $rel | jq -r '.name')
-          url=$(echo $rel | jq -r '.html_url')
-          body=$(echo $rel | jq -r '.body' | head -c 1200)
+          # 全部用 jq 直接读 rel.json，彻底避免 shell 拼接 JSON
+          tag=$(jq -r '.tag_name' rel.json)
+          name=$(jq -r '.name // .tag_name' rel.json)
+          url=$(jq -r '.html_url' rel.json)
+          body=$(jq -r '.body // ""' rel.json | head -c 1200)
 
+          # 构造 jq 过滤器
           IFS=',' read -ra exts <<< "$ALLOW_EXT"
           filter=""
           for e in "${exts[@]}"; do
@@ -70,33 +86,39 @@ jobs:
               filter="$filter or endswith(\"$e\")"
             fi
           done
-          assets=$(echo $rel | jq -r --arg filter "$filter" '.assets[] | select(.name | $filter) | "- [" + .name + "](" + .browser_download_url + ")"' | head -5)
+
+          assets=$(jq -r --arg filter "$filter" \
+            '.assets[] | select(.name | $filter) | "- [" + .name + "](" + .browser_download_url + ")"' \
+            rel.json | head -5)
           if [ -z "$assets" ]; then
             assets="无匹配过滤规则的安装包"
           fi
 
-          # ✅ 改用Markdown语法，没有< >，YAML不会报错！
-          MSG="*🚀发现新版本 Release*
-仓库：\`${TARGET_OWNER}/${TARGET_REPO}\`
-版本：\`${tag}\`
-标题：${name}
-[查看Release页面](${url})
+          # 组装消息（放到临时文件，用 --data-urlencode 发送，避免引号问题）
+          MSG_FILE=$(mktemp)
+          {
+            echo "*🚀发现新版本 Release*"
+            echo "仓库：\`${OWNER}/${REPO}\`"
+            echo "版本：\`${tag}\`"
+            echo "标题：${name}"
+            echo "[查看Release页面](${url})"
+            echo ""
+            echo "📦匹配资产："
+            echo "${assets}"
+            echo ""
+            echo "📝更新日志："
+            echo '```'
+            echo "${body}"
+            echo '```'
+          } > "$MSG_FILE"
 
-📦匹配资产：
-${assets}
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT_ID}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true" \
+            --data-urlencode "text@${MSG_FILE}"
 
-📝更新日志：
-\`\`\`
-${body}
-\`\`\`"
-
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage \
-            -d chat_id=${{ secrets.TG_CHAT_ID }} \
-            -d parse_mode=Markdown \
-            -d disable_web_page_preview=true \
-            --data-urlencode text="$MSG"
-
-          echo $tag > last_tag.txt
+          echo "$tag" > last_tag.txt
 
       - name: commit new tag
         if: env.TAG != env.LAST_TAG
@@ -104,5 +126,5 @@ ${body}
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
           git add last_tag.txt
-          git commit -m "update last tag: ${{ env.TAG }}"
+          git commit -m "update last tag: ${{ env.TAG }}" || echo "nothing to commit"
           git push

@@ -187,8 +187,9 @@ jobs:
             case "$filename" in
               *leanback*arm64*)   display_name="📺 TV ARM64版" ;;
               *leanback*armeabi*) display_name="📺 TV ARMeabi版" ;;
-              *mobile*)           display_name="📱 安卓版" ;;
-              *windows*|*.exe)    display_name="🪟 Windows 客户端" ;;
+              *mobile*v8*)           display_name="📱 安卓版 v8" ;;
+              *mobile*v7*)           display_name="📱 安卓版 v7" ;;
+              *windows*|*pc*|*.exe)    display_name="🪟 Windows 客户端" ;;
               *macos*|*darwin*)   display_name="🍎 macOS 客户端" ;;
               *universal*)        display_name="📦 通用版" ;;
               *x86*|*x64*)        display_name="💻 电脑 x86/x64版" ;;

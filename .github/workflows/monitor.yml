@@ -14,7 +14,7 @@ jobs:
       - id: set-matrix
         run: |
           # 在这里配置你要监控的仓库列表，支持无限添加
-          WATCH_LIST='["Silent1566/webhtv""Silent1566/webhtv-pc"]'
+          WATCH_LIST='["Silent1566/webhtv","Silent1566/webhtv-pc"]'
           echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
 
   # 第二步：并发处理每个仓库

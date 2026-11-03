@@ -12,7 +12,7 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc","jay3-yy/BiliPai","webhtv/webhtv","HapeLee/legado-with-MD3"]'
+          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc","jay3-yy/BiliPai","webhtv/webhtv","HapeLee/legado-with-MD3]'
           echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
 
   check-release:
@@ -22,6 +22,7 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
     env:
       FULL_REPO: ${{ matrix.repo }}
@@ -34,6 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
 
       - name: install jq + coreutils (for vercmp)
         run: sudo apt update && sudo apt install -y jq coreutils
@@ -263,8 +265,15 @@ jobs:
           git config --global user.name "release-bot"
           git config --global user.email "bot@example.com"
 
+          git add "$LAST_TAG_FILE"
+
+          # 暂存区无变更直接退出，不commit
+          if git diff --staged --quiet; then
+            echo "ℹ️ 文件内容无变化，无需提交"
+            exit 0
+          fi
+
           for i in {1..3}; do
-            git add "$LAST_TAG_FILE"
             git commit -m "update tag: ${FULL_REPO} -> ${UPSTREAM_TAG} [skip ci]"
             if git push; then
               echo "✅ 版本记录提交成功"
@@ -272,6 +281,15 @@ jobs:
             else
               echo "⚠️ push冲突，尝试拉取合并重试 $i/3"
               git pull --rebase
+              # rebase后如果已经有这条commit，跳出循环
+              if git diff --staged --quiet && git log -1 --pretty=%B | grep -q "update tag: ${FULL_REPO} -> ${UPSTREAM_TAG}"; then
+                echo "✅ rebase后commit已存在，无需重复提交"
+                break
+              fi
               sleep 2
             fi
           done
+
+          # 清理临时文件
+          rm -f releases.json rel.json dl_links.txt mirror_assets.txt mirror_body.md mirror_rel.json
+          rm -rf downloads

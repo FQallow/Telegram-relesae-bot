@@ -12,8 +12,9 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc","jay3-yy/BiliPai","webhtv/webhtv","HapeLee/legado-with-MD3]'
-          echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
+          # 在这里添加/删除仓库，jq自动生成合法JSON，不会引号报错
+          jq -c -n '["Silent1566/webhtv", "Silent1566/webhtv-pc", "webhtv/webhtv", "HapeLee/legado-with-MD3"]' > matrix.json
+          echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
 
   check-release:
     needs: setup
@@ -291,5 +292,5 @@ jobs:
           done
 
           # 清理临时文件
-          rm -f releases.json rel.json dl_links.txt mirror_assets.txt mirror_body.md mirror_rel.json
+          rm -f releases.json rel.json dl_links.txt mirror_assets.txt mirror_body.md mirror_rel.json matrix.json
           rm -rf downloads

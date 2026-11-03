@@ -158,6 +158,7 @@ jobs:
             '.assets[] | select((.name | $filter) and (.name | test("\\.(json|txt|md)$"; "i") | not)) | .browser_download_url' \
             rel.json > dl_links.txt
 
+          MAX_BYTES=$(( MAX_UPLOAD_MB * 1024 * 1024 ))
           download_success=false
           while read -r dl_url; do
             [ -z "$dl_url" ] && continue
@@ -170,15 +171,15 @@ jobs:
             fi
             download_success=true
 
-            # 计算大小（字节 → MB，向上取整）
+            # 用字节直接比较，避免取整误差
             size_bytes=$(stat -c%s "downloads/$filename")
-            size_mb=$(( (size_bytes + 1024*1024 - 1) / (1024*1024) ))
+            size_mb=$(( size_bytes / 1024 / 1024 ))
 
-            if [ "$size_mb" -lt "$MAX_UPLOAD_MB" ]; then
-              echo "  ✅ 大小 ${size_mb}MB < ${MAX_UPLOAD_MB}MB，加入上传列表"
+            if [ "$size_bytes" -lt "$MAX_BYTES" ]; then
+              echo "  ✅ ${size_mb}MB < ${MAX_UPLOAD_MB}MB，加入上传列表"
               echo "downloads/$filename" >> upload_files.txt
             else
-              echo "  📎 大小 ${size_mb}MB ≥ ${MAX_UPLOAD_MB}MB，仅发原始链接"
+              echo "  📎 ${size_mb}MB ≥ ${MAX_UPLOAD_MB}MB，仅发原始链接"
               echo "${filename}|${dl_url}" >> link_only.txt
               rm -f "downloads/$filename"
             fi
@@ -218,24 +219,24 @@ jobs:
           } > "$MSG_FILE"
           echo "MSG_FILE_PATH=${MSG_FILE}" >> $GITHUB_ENV
 
-      - name: prepare upload file list
+      - name: debug upload list
         if: env.SKIP != 'true' && env.NO_UPLOAD != 'true'
         run: |
-          {
-            echo "UPLOAD_FILES_LIST<<EOF"
-            cat upload_files.txt
-            echo "EOF"
-          } >> $GITHUB_ENV
+          echo "=== upload_files.txt ==="
+          cat -A upload_files.txt || true
+          echo "=== link_only.txt ==="
+          cat -A link_only.txt || true
+          echo "=== downloads/ ==="
+          ls -la downloads/ || true
 
       - name: create mirror release
         if: env.SKIP != 'true' && env.NO_UPLOAD != 'true'
-        continue-on-error: true
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.MIRROR_TAG }}
           name: ${{ env.MIRROR_NAME }}
           body_path: ${{ env.MIRROR_BODY_FILE }}
-          files: ${{ env.UPLOAD_FILES_LIST }}
+          files: downloads/*
           token: ${{ secrets.GH_PAT }}
           fail_on_unmatched_files: false
         env:

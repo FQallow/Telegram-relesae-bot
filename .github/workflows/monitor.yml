@@ -12,7 +12,7 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc","webhtv/webhtv"]'
+          WATCH_LIST='["Silent1566/webhtv", "Silent1566/webhtv-pc","jay3-yy/BiliPai","webhtv/webhtv","HapeLee/legado-with-MD3"]'
           echo "matrix={\"repo\":$WATCH_LIST}" >> $GITHUB_OUTPUT
 
   check-release:

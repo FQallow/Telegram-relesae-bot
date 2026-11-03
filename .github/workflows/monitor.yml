@@ -12,8 +12,15 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          # 在这里添加/删除仓库，jq自动生成合法JSON，不会引号报错
-          jq -c -n '["Silent1566/webhtv", "Silent1566/webhtv-pc", "webhtv/webhtv", "HapeLee/legado-with-MD3"]' > matrix.json
+          # 在这里增删仓库，jq自动生成合法matrix对象
+          jq -c -n '{
+            repo: [
+              "Silent1566/webhtv",
+              "Silent1566/webhtv-pc",
+              "webhtv/webhtv",
+              "HapeLee/legado-with-MD3"
+            ]
+          }' > matrix.json
           echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
 
   check-release:

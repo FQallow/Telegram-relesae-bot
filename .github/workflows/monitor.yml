@@ -29,7 +29,6 @@ jobs:
       ALLOW_EXT: ".apk,.exe,.zip,.AppImage"
       GH_PROXY: "https://gh-proxy.com/"
       GH_TOKEN: ${{ secrets.GH_PAT }}
-      MAX_UPLOAD_MB: "50"
     steps:
       - name: checkout repo
         uses: actions/checkout@v4
@@ -96,6 +95,7 @@ jobs:
           VER_LAST=$(strip_v "$LAST_TAG")
 
           # vercmp: 0相等，1新的更大，2旧的更大
+          # vercmp a b: a > b → 返回 1
           if [ -n "$VER_LAST" ]; then
             if vercmp "$VER_CUR" "$VER_LAST" -eq 2; then
               echo "⏭️ 上游版本 $tag 旧于上次记录 $LAST_TAG，判定为回滚，跳过"
@@ -116,7 +116,7 @@ jobs:
           echo "MIRROR_TAG=${SAFE_TAG}" >> $GITHUB_ENV
           echo "MIRROR_NAME=[镜像] ${FULL_REPO} ${tag}" >> $GITHUB_ENV
 
-          # 导出转义函数给后面步骤
+          # 导出转义函数给后面步骤（写入环境变量，后续TG步骤调用）
           echo 'TG_ESCAPE_FUNC=tg_escape() { echo "$1" | sed -e '\''s/[_*\[`\]~]/\\&/g'\''; }' >> $GITHUB_ENV
 
       - name: download assets
@@ -148,62 +148,25 @@ jobs:
           done
 
           mkdir -p downloads
-          # 两个清单：
-          #   upload_files.txt —— 小于阈值的文件（需上传镜像 Release）
-          #   link_only.txt    —— 大于等于阈值的文件（name|original_url，只发直链）
-          : > upload_files.txt
-          : > link_only.txt
-
           jq -r --arg filter "$filter" \
             '.assets[] | select((.name | $filter) and (.name | test("\\.(json|txt|md)$"; "i") | not)) | .browser_download_url' \
             rel.json > dl_links.txt
 
-          MAX_BYTES=$(( MAX_UPLOAD_MB * 1024 * 1024 ))
           download_success=false
           while read -r dl_url; do
             [ -z "$dl_url" ] && continue
             filename=$(basename "$dl_url")
             echo "⬇️ 下载 $filename"
             curl -L -s -o "downloads/$filename" "${GH_PROXY}${dl_url}"
-
-            if [ ! -f "downloads/$filename" ]; then
-              continue
-            fi
-            download_success=true
-
-            # 用字节直接比较，避免取整误差
-            size_bytes=$(stat -c%s "downloads/$filename")
-            size_mb=$(( size_bytes / 1024 / 1024 ))
-
-            if [ "$size_bytes" -lt "$MAX_BYTES" ]; then
-              echo "  ✅ ${size_mb}MB < ${MAX_UPLOAD_MB}MB，加入上传列表"
-              echo "downloads/$filename" >> upload_files.txt
-            else
-              echo "  📎 ${size_mb}MB ≥ ${MAX_UPLOAD_MB}MB，仅发原始链接"
-              echo "${filename}|${dl_url}" >> link_only.txt
-              rm -f "downloads/$filename"
-            fi
+            [ -f "downloads/$filename" ] && download_success=true
           done < dl_links.txt
 
           find downloads/ -type f \( -name "*.json" -o -name "*.txt" -o -name "*.md" \) -delete
 
-          upload_count=$(wc -l < upload_files.txt | tr -d ' ')
-          link_count=$(wc -l < link_only.txt   | tr -d ' ')
-          echo "📊 待上传文件数: ${upload_count}，仅链接文件数: ${link_count}"
-
-          if [ "$download_success" = "false" ] || \
-             { [ "$upload_count" -eq 0 ] && [ "$link_count" -eq 0 ]; }; then
+          if [ "$download_success" = "false" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
             echo "⚠️ 没有匹配的安装包，跳过"
             echo "SKIP=true" >> $GITHUB_ENV
             exit 0
-          fi
-
-          # 若全部超限，则不创建镜像 Release，仅发 TG
-          if [ "$upload_count" -eq 0 ]; then
-            echo "ℹ️ 所有资产均超限，将跳过 GitHub Release，仅发送 Telegram"
-            echo "NO_UPLOAD=true" >> $GITHUB_ENV
-          else
-            echo "NO_UPLOAD=false" >> $GITHUB_ENV
           fi
 
           name=$(jq -r '.name // .tag_name' rel.json)
@@ -219,18 +182,9 @@ jobs:
           } > "$MSG_FILE"
           echo "MSG_FILE_PATH=${MSG_FILE}" >> $GITHUB_ENV
 
-      - name: debug upload list
-        if: env.SKIP != 'true' && env.NO_UPLOAD != 'true'
-        run: |
-          echo "=== upload_files.txt ==="
-          cat -A upload_files.txt || true
-          echo "=== link_only.txt ==="
-          cat -A link_only.txt || true
-          echo "=== downloads/ ==="
-          ls -la downloads/ || true
-
       - name: create mirror release
-        if: env.SKIP != 'true' && env.NO_UPLOAD != 'true'
+        if: env.SKIP != 'true'
+        continue-on-error: true
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.MIRROR_TAG }}
@@ -254,49 +208,27 @@ jobs:
             echo "$1" | sed -e 's/[_*\[`\]~]/\\&/g'
           }
 
-          # 文件名 → 友好显示名
-          friendly_name() {
-            local filename="$1"
-            case "$filename" in
-              *leanback*arm64*)      echo "📺 TV ARM64版" ;;
-              *leanback*armeabi*)    echo "📺 TV ARMeabi版" ;;
-              *mobile*v8*)           echo "📱 安卓版 v8" ;;
-              *mobile*v7*)           echo "📱 安卓版 v7" ;;
-              *windows*|*pc*|*.exe)  echo "🪟 Windows 客户端" ;;
-              *macos*|*darwin*)      echo "🍎 macOS 客户端" ;;
-              *universal*)           echo "📦 通用版" ;;
-              *x86*|*x64*)           echo "💻 电脑 x86/x64版" ;;
-              *)                     echo "$filename" ;;
-            esac
-          }
+          MIRROR_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/${MIRROR_TAG}"
+          curl -s -H "Authorization: token $GH_TOKEN" "$MIRROR_API" > mirror_rel.json
 
           assets=""
-
-          # ---- 3.1 已上传到镜像仓库的资产 ----
-          if [ "$NO_UPLOAD" != "true" ]; then
-            MIRROR_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/${MIRROR_TAG}"
-            curl -s -H "Authorization: token $GH_TOKEN" "$MIRROR_API" > mirror_rel.json
-            jq -r '.assets[] | .name + "|" + .browser_download_url' mirror_rel.json > mirror_assets.txt 2>/dev/null || : > mirror_assets.txt
-            if [ -s mirror_assets.txt ]; then
-              while IFS='|' read -r filename download_url; do
-                [ -z "$filename" ] && continue
-                full_url="${GH_PROXY}${download_url}"
-                display_name=$(friendly_name "$filename")
-                assets="${assets}- [${display_name}](${full_url})  \`(镜像)\`"$'\n'
-              done < mirror_assets.txt
-            fi
-          fi
-
-          # ---- 3.2 超限仅链接资产（原始上游下载 URL）----
-          if [ -s link_only.txt ]; then
-            while IFS='|' read -r filename dl_url; do
-              [ -z "$filename" ] && continue
-              full_url="${GH_PROXY}${dl_url}"
-              display_name=$(friendly_name "$filename")
-              assets="${assets}- [${display_name}](${full_url})  \`(直链, 超过${MAX_UPLOAD_MB}MB未镜像)\`"$'\n'
-            done < link_only.txt
-          fi
-
+          jq -r '.assets[] | .name + "|" + .browser_download_url' mirror_rel.json > mirror_assets.txt
+          while IFS='|' read -r filename download_url; do
+            [ -z "$filename" ] && continue
+            full_url="${GH_PROXY}${download_url}"
+            display_name="$filename"
+            case "$filename" in
+              *leanback*arm64*)   display_name="📺 TV ARM64版" ;;
+              *leanback*armeabi*) display_name="📺 TV ARMeabi版" ;;
+              *mobile*v8*)        display_name="📱 安卓版 v8" ;;
+              *mobile*v7*)        display_name="📱 安卓版 v7" ;;
+              *windows*|*pc*|*.exe) display_name="🪟 Windows 客户端" ;;
+              *macos*|*darwin*)   display_name="🍎 macOS 客户端" ;;
+              *universal*)        display_name="📦 通用版" ;;
+              *x86*|*x64*)        display_name="💻 电脑 x86/x64版" ;;
+            esac
+            assets="${assets}- [${display_name}](${full_url})"$'\n'
+          done < mirror_assets.txt
           [ -z "$assets" ] && assets="无匹配过滤规则的安装包"
 
           RAW_BODY=$(jq -r '.body // ""' rel.json)
@@ -305,7 +237,7 @@ jobs:
           CUT_BODY=$(tg_escape "$CUT_BODY_RAW")
 
           {
-            echo "📦下载资产："
+            echo "📦下载资产（本仓库镜像）："
             echo -e "${assets}"
             echo ""
             echo "📝更新日志："
@@ -333,7 +265,7 @@ jobs:
 
           for i in {1..3}; do
             git add "$LAST_TAG_FILE"
-            git commit -m "update tag: ${FULL_REPO} -> ${UPSTREAM_TAG} [skip ci]" || true
+            git commit -m "update tag: ${FULL_REPO} -> ${UPSTREAM_TAG} [skip ci]"
             if git push; then
               echo "✅ 版本记录提交成功"
               break
